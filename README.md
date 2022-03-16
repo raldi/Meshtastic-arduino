@@ -1,2 +1,2 @@
-# Meshtastic-arduino
 Meshtastic Arduino "Hello World"
+Author: Mike Schiraldi
