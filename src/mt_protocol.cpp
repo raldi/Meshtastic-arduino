@@ -1,4 +1,4 @@
-#include "mt_protocol.h"
+#include "mt_internals.h"
 
 // Magic number at the start of all MT packets
 #define MT_MAGIC_0 0x94
@@ -9,14 +9,12 @@
 
 // The buffer used for protobuf encoding/decoding. Since there's only one, and it's global, we
 // have to make sure we're only ever doing one encoding or decoding at a time.
+#define PB_BUFSIZE 512
 pb_byte_t pb_buf[PB_BUFSIZE+4];
 size_t pb_size = 0; // Number of bytes currently in the buffer
 
-// Some sane limits on a few strings that the protocol would otherwise allow to be unlimited length
-#define MAX_USER_ID_LEN 32
-#define MAX_LONG_NAME_LEN 32
-#define MAX_SHORT_NAME_LEN 8
-#define MAX_MACADDR_LEN 32
+// Wait this many msec if there's nothing new on the channel
+#define NO_NEWS_PAUSE 25
 
 // The ID of the current WANT_CONFIG request
 uint32_t want_config_id = 0;
@@ -24,8 +22,34 @@ uint32_t want_config_id = 0;
 // Node number of the MT node hosting our WiFi
 uint32_t my_node_num = 0;
 
+bool mt_debugging = false;
+void (*node_report_callback)(mt_node_t *, mt_nr_progress_t) = NULL;
+mt_node_t node;
+
+bool mt_wifi_mode = false;
+bool mt_serial_mode = false;
+
+void d(const char * s) {
+  if (mt_debugging) Serial.println(s);
+}
+
+void mt_set_debug(bool on) {
+  mt_debugging = on;
+}
+
+bool mt_send_radio(const char * buf, size_t len) {
+  if (mt_wifi_mode) {
+    return mt_wifi_send_radio(buf, len);
+  } else if (mt_serial_mode) {
+    return mt_serial_send_radio(buf, len);
+  } else {
+    Serial.println("mt_send_radio() called but it was never initialized");
+    while(1);
+  }
+}
+
 // Request a node report from our MT
-bool mt_protocol_send_wantconfig() {
+bool mt_request_node_report(void (*callback)(mt_node_t *, mt_nr_progress_t)) {
   ToRadio toRadio = ToRadio_init_default;
   toRadio.which_payloadVariant = ToRadio_want_config_id_tag;
   want_config_id = random(0x7FffFFff);  // random() can't handle anything bigger
@@ -37,84 +61,86 @@ bool mt_protocol_send_wantconfig() {
   pb_ostream_t stream = pb_ostream_from_buffer(pb_buf + 4, PB_BUFSIZE);
   bool status = pb_encode(&stream, ToRadio_fields, &toRadio);
   if (!status) {
-    Serial.println("Couldn't encode wantconfig");
+    d("Couldn't encode wantconfig");
     return false;
   }
 
-  Serial.print("Requesting node report with random ID ");
-  Serial.println(want_config_id);
+  if (mt_debugging) {
+    Serial.print("Requesting node report with random ID ");
+    Serial.println(want_config_id);
+  }
 
   // Store the payload length in the header
   pb_buf[2] = stream.bytes_written / 256;
   pb_buf[3] = stream.bytes_written % 256;
 
-  bool rv = mt_wifi_send_radio((const char *)pb_buf, 4 + stream.bytes_written);
+  bool rv = mt_send_radio((const char *)pb_buf, 4 + stream.bytes_written);
 
   // Clear the buffer so it can be used to hold reply packets
   pb_size = 0;
+  if (rv) node_report_callback = callback;
   return rv;
 }
 
 bool handle_my_info(MyNodeInfo *myNodeInfo) {
   my_node_num = myNodeInfo->my_node_num;
-  Serial.print("Looks like my node number is ");
-  Serial.println(my_node_num);
+  if (mt_debugging) {
+    Serial.print("Looks like my node number is ");
+    Serial.println(my_node_num);
+  }
   return true;
 }
 
 bool handle_node_info(NodeInfo *nodeInfo, pb_byte_t * user_id, pb_byte_t * long_name,
                       pb_byte_t * short_name, pb_byte_t * macaddr) {
-  Serial.print("The node at ");
-  Serial.print(nodeInfo->num);
-  if (nodeInfo->num == my_node_num) {
-    Serial.print(" (that's me!)");
+  if (node_report_callback == NULL) {
+    d("Got a node report, but we don't have a callback");
+    return false;
   }
-  Serial.print(", last reached at time=");
-  Serial.print(nodeInfo->last_heard);
-
+  node.node_num = nodeInfo->num;
+  node.is_mine = nodeInfo->num == my_node_num;
+  node.last_heard_from = nodeInfo->last_heard;
   if (nodeInfo->has_user) {
-    Serial.print(", belongs to '");
-    Serial.print((char *)long_name);
-    Serial.print("' (a.k.a. '");
-    Serial.print((char *)short_name);
-    Serial.print("' or '");
-    Serial.print((char *)user_id);
-    Serial.print("' at '");
-    Serial.print((char *)macaddr);
-    Serial.print("') ");
+    node.user_id = (const char *) user_id;
+    node.long_name = (const char *) long_name;
+    node.short_name = (const char *) short_name;
+    node.macaddr = (const char *) macaddr;
   } else {
-    Serial.print(", is anonymous ");
+    node.user_id = NULL;
+    node.long_name = NULL;
+    node.short_name = NULL;
+    node.macaddr = NULL; 
   }
 
   if (nodeInfo->has_position) {
-    Serial.print("and is at ");
-    Serial.print(nodeInfo->position.latitude_i / 1e7);
-    Serial.print(", ");
-    Serial.print(nodeInfo->position.longitude_i / 1e7);
-    Serial.print("; ");
-    Serial.print(nodeInfo->position.altitude);
-    Serial.print("m above sea level moving at ");
-    Serial.print(nodeInfo->position.ground_speed);
-    Serial.print(" m/s as of time=");
-    Serial.print(nodeInfo->position.pos_timestamp);
-    Serial.print(" and their battery is at ");
-    Serial.print(nodeInfo->position.battery_level);
-    Serial.print(" and they told our node at time=");
-    Serial.println(nodeInfo->position.time);
+    node.latitude = nodeInfo->position.latitude_i / 1e7;
+    node.longitude = nodeInfo->position.longitude_i / 1e7;
+    node.altitude = nodeInfo->position.altitude;
+    node.ground_speed = nodeInfo->position.ground_speed;
+    node.battery_level = nodeInfo->position.battery_level;
+    node.last_heard_position = nodeInfo->position.time;
+    node.time_of_last_position = nodeInfo->position.pos_timestamp;
   } else {
-    Serial.println(" has no position");
+    node.latitude = NAN;
+    node.longitude = NAN;
+    node.altitude = 0;
+    node.ground_speed = 0;
+    node.battery_level = 0;
+    node.last_heard_position = 0;
+    node.time_of_last_position = 0;
   }
-
+  node_report_callback(&node, MT_NR_IN_PROGRESS);
   return true;
 }
 
 bool handle_config_complete_id(uint32_t now, uint32_t config_complete_id) {
   if (config_complete_id == want_config_id) {
-    Serial.println("And that's all the all nodes");
     mt_wifi_reset_idle_timeout(now);
     want_config_id = 0;
+    node_report_callback(NULL, MT_NR_DONE);
+    node_report_callback = NULL;
   } else {
-    Serial.println("Disregard all of the above; it was an answer to someone else's question");  // Return true anyway
+    node_report_callback(NULL, MT_NR_INVALID);  // but return true, since it was still a valid packet
   }
   return true;
 }
@@ -170,7 +196,7 @@ bool handle_packet(uint32_t now, size_t payload_len) {
   pb_size -= 4 + payload_len;
 
   if (!status) {
-    Serial.println("Decoding failed");
+    d("Decoding failed");
     return false;
   }
 
@@ -188,42 +214,73 @@ bool handle_packet(uint32_t now, size_t payload_len) {
                      // https://github.com/meshtastic/Meshtastic-protobufs/blob/3bd1aec912d4bc1f4d9c42f6c60c766ed281d801/mesh.proto#L721-L922
                      // (or the latest version of that file) for all the fields you'll need to implement.
     default:
-      Serial.print("Got a payloadVariant we don't recognize: ");
-      Serial.println(fromRadio.which_payloadVariant);
+      if (mt_debugging) {
+        Serial.print("Got a payloadVariant we don't recognize: ");
+        Serial.println(fromRadio.which_payloadVariant);
+      }
       return false;
   }
 
-  Serial.println("Handled a packet");
+  d("Handled a packet");
 }
 
-
 void mt_protocol_check_packet(uint32_t now) {
-  if (pb_size < MT_HEADER_SIZE) return;  // We don't even have a header yet
+  if (pb_size < MT_HEADER_SIZE) {
+    // We don't even have a header yet
+    delay(NO_NEWS_PAUSE);
+    return;
+  }
 
   if (pb_buf[0] != MT_MAGIC_0 || pb_buf[1] != MT_MAGIC_1) {
-    Serial.println("Got bad magic");
+    d("Got bad magic");
     return;
   }
 
   uint16_t payload_len = pb_buf[2] << 8 | pb_buf[3];
   if (payload_len > PB_BUFSIZE) {
-    Serial.println("Got packet claiming to be ridiculous length");
+    d("Got packet claiming to be ridiculous length");
     return;
   }
 
   if (payload_len + 4 > pb_size) {
-    // Serial.println("Partial packet");
+    // d("Partial packet");
+    delay(NO_NEWS_PAUSE);
     return;
   }
 
   /*
-  Serial.print("Got a full packet! ");
-  for (int i = 0 ; i < pb_size ; i++) {
-    Serial.print(pb_buf[i], HEX);
-    Serial.print(" ");
+  if (mt_debugging) {
+    Serial.print("Got a full packet! ");
+    for (int i = 0 ; i < pb_size ; i++) {
+      Serial.print(pb_buf[i], HEX);
+      Serial.print(" ");
+    }
+    Serial.println();
   }
-  Serial.println();
   */
 
   handle_packet(now, payload_len);
+}
+
+bool mt_loop(uint32_t now) {
+  bool rv;
+  size_t bytes_read = 0;
+
+  // See if there are any more bytes to add to our buffer.
+  size_t space_left = PB_BUFSIZE - pb_size;
+ 
+  if (mt_wifi_mode) {
+    rv = mt_wifi_loop();
+    if (rv) bytes_read = mt_wifi_check_radio((char *)pb_buf + pb_size, space_left);
+  } else if (mt_serial_mode) {
+    rv = mt_serial_loop();
+    if (rv) bytes_read = mt_serial_check_radio((char *)pb_buf + pb_size, space_left);
+  } else {
+    Serial.println("mt_loop() called but it was never initialized");
+    while(1);
+  }
+
+  pb_size += bytes_read;
+  mt_protocol_check_packet(now); 
+  return rv;
 }
