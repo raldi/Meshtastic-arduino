@@ -42,7 +42,7 @@ void setup() {
 #endif
   Serial.println(" mode");
 
-  // Uncomment to get lots of debugging info on the serial console
+  // Comment out if you want a quiet console
   mt_set_debug(true);
   randomSeed(micros());
 }

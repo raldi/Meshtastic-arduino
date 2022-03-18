@@ -11,7 +11,7 @@ void mt_debug_print(const char * s);
 extern bool mt_wifi_mode;
 extern bool mt_serial_mode;
 
-bool mt_wifi_loop();
+bool mt_wifi_loop(uint32_t now);
 bool mt_serial_loop();
 
 size_t mt_wifi_check_radio(char * buf, size_t space_left);

@@ -64,6 +64,4 @@ typedef enum {
 // even do that.
 bool mt_request_node_report(void (*callback)(mt_node_t *, mt_nr_progress_t));
 
-
-
 #endif

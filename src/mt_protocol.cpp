@@ -135,7 +135,7 @@ bool handle_node_info(NodeInfo *nodeInfo, pb_byte_t * user_id, pb_byte_t * long_
 
 bool handle_config_complete_id(uint32_t now, uint32_t config_complete_id) {
   if (config_complete_id == want_config_id) {
-    mt_wifi_reset_idle_timeout(now);
+    mt_wifi_reset_idle_timeout(now);  // It's fine if we're actually in serial mode
     want_config_id = 0;
     node_report_callback(NULL, MT_NR_DONE);
     node_report_callback = NULL;
@@ -270,7 +270,7 @@ bool mt_loop(uint32_t now) {
   size_t space_left = PB_BUFSIZE - pb_size;
  
   if (mt_wifi_mode) {
-    rv = mt_wifi_loop();
+    rv = mt_wifi_loop(now);
     if (rv) bytes_read = mt_wifi_check_radio((char *)pb_buf + pb_size, space_left);
   } else if (mt_serial_mode) {
     rv = mt_serial_loop();

@@ -58,8 +58,7 @@ bool open_tcp_connection() {
   return can_send;
 }
 
-bool mt_wifi_loop() {
-  uint32_t now = millis();
+bool mt_wifi_loop(uint32_t now) {
   uint8_t wifi_status = WiFi.status();
 
   // Is it time to try (re)connecting?
